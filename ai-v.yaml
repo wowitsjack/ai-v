@@ -102,6 +102,14 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
+  - id: button_press_time
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: mute_animation_active
+    type: bool
+    restore_value: no
+    initial_value: 'false'
   - id: factory_reset_requested
     type: bool
     restore_value: no
@@ -152,7 +160,7 @@ switch:
 # Binary Sensors
 # ============================================================================
 binary_sensor:
-  # Center Button: Press to record, release to process
+  # Center Button: Hold to record (min 2s), release to process
   - platform: gpio
     id: center_button
     pin:
@@ -163,11 +171,19 @@ binary_sensor:
           condition:
             switch.is_off: master_mute_switch
           then:
+            - lambda: id(button_press_time) = millis();
             - ai_voice.start_recording: ai_assistant
             - script.execute: control_leds
     on_release:
-      - ai_voice.stop_recording: ai_assistant
-      - script.execute: control_leds
+      - if:
+          condition:
+            lambda: return (millis() - id(button_press_time)) >= 2000;
+          then:
+            - ai_voice.stop_recording: ai_assistant
+            - script.execute: control_leds
+          else:
+            - ai_voice.abort: ai_assistant
+            - script.execute: control_leds
 
   # Hardware mute switch
   - platform: gpio
@@ -176,10 +192,10 @@ binary_sensor:
     pin: GPIO3
     on_press:
       - microphone.mute:
-      - script.execute: control_leds
+      - script.execute: show_muted
     on_release:
       - microphone.unmute:
-      - script.execute: control_leds
+      - script.execute: show_unmuted
 
   # Audio Jack
   - platform: gpio
@@ -344,7 +360,7 @@ light:
               it[6] = Color(255, 0, 0);  // red dot at zero
             }
       - addressable_lambda:
-          name: "Muted"
+          name: "Red Pulse"
           update_interval: 10ms
           lambda: |-
             static uint8_t step = 0;
@@ -352,9 +368,19 @@ light:
             if (initial_run) { step = 0; decreasing = true; }
             Color red(255, 0, 0);
             uint8_t b = (uint8_t)(255 - (255 * step / 10));
-            for (uint8_t i = 0; i < 12; i++) {
-              it[i] = red * b;
-            }
+            for (uint8_t i = 0; i < 12; i++) { it[i] = red * b; }
+            if (decreasing) step++; else step--;
+            if (step == 0 || step == 10) decreasing = !decreasing;
+      - addressable_lambda:
+          name: "Green Pulse"
+          update_interval: 10ms
+          lambda: |-
+            static uint8_t step = 0;
+            static bool decreasing = true;
+            if (initial_run) { step = 0; decreasing = true; }
+            Color green(0, 255, 0);
+            uint8_t b = (uint8_t)(255 - (255 * step / 10));
+            for (uint8_t i = 0; i < 12; i++) { it[i] = green * b; }
             if (decreasing) step++; else step--;
             if (step == 0 || step == 10) decreasing = !decreasing;
       - addressable_lambda:
@@ -608,7 +634,9 @@ script:
     then:
       - if:
           condition:
-            light.is_on: voice_assistant_leds
+            and:
+              - light.is_on: voice_assistant_leds
+              - lambda: return !id(mute_animation_active);
           then:
             - light.turn_off: voice_assistant_leds
 
@@ -640,14 +668,34 @@ script:
           id: voice_assistant_leds
           effect: "Volume Display"
 
+  - id: show_muted
+    mode: restart
+    then:
+      - lambda: id(mute_animation_active) = true;
+      - light.turn_on:
+          brightness: 80%
+          id: voice_assistant_leds
+          effect: "Red Pulse"
+      - delay: 3s
+      - light.turn_off: voice_assistant_leds
+      - lambda: id(mute_animation_active) = false;
+
+  - id: show_unmuted
+    mode: restart
+    then:
+      - script.stop: show_muted
+      - lambda: id(mute_animation_active) = true;
+      - light.turn_on:
+          brightness: 80%
+          id: voice_assistant_leds
+          effect: "Green Pulse"
+      - delay: 3s
+      - light.turn_off: voice_assistant_leds
+      - lambda: id(mute_animation_active) = false;
+
   - id: control_leds_muted
     then:
-      - light.turn_on:
-          brightness: 60%
-          id: voice_assistant_leds
-          effect: "Muted"
-      - delay: 2s
-      - light.turn_off: voice_assistant_leds
+      - script.execute: show_muted
 
   - id: control_leds_error
     then:
