@@ -526,13 +526,16 @@ sensor:
 # Phase change monitor (pipeline runs on Core 1, LEDs on main loop)
 # ============================================================================
 interval:
-  - interval: 200ms
+  - interval: 250ms
     then:
       - if:
           condition:
             lambda: return id(ai_assistant).phase_changed();
           then:
             - script.execute: control_leds
+            - component.update: ai_status
+            - component.update: last_transcript
+            - component.update: last_error
 
 # ============================================================================
 # LED Control Script
@@ -603,7 +606,11 @@ script:
 
   - id: control_leds_idle
     then:
-      - light.turn_off: voice_assistant_leds
+      - if:
+          condition:
+            light.is_on: voice_assistant_leds
+          then:
+            - light.turn_off: voice_assistant_leds
 
   - id: control_leds_recording
     then:
@@ -999,20 +1006,19 @@ text_sensor:
   - platform: template
     name: "Last Transcript"
     id: last_transcript
-    update_interval: 2s
+    update_interval: never
     lambda: return id(ai_assistant).get_last_transcript();
   - platform: template
     name: "Last Error"
     id: last_error
-    update_interval: 2s
+    update_interval: never
     lambda: return id(ai_assistant).get_last_error();
   - platform: template
     name: "AI Status"
     id: ai_status
-    update_interval: 1s
+    update_interval: never
     lambda: |-
       int phase = id(ai_assistant).get_voice_phase();
-      // Phases: 1=idle, 2=stt, 3=recording, 4=thinking(llm), 5=speaking, 10=not_ready, 11=error
       switch(phase) {
         case 1: return std::string("idle");
         case 2: return std::string("stt");
@@ -1021,5 +1027,5 @@ text_sensor:
         case 5: return std::string("speaking");
         case 10: return std::string("not_ready");
         case 11: return std::string("error");
-        default: return std::string("unknown:" + std::to_string(phase));
+        default: return std::string("unknown");
       }
