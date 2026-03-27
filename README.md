@@ -15,10 +15,23 @@ The LLM, STT, and TTS providers are all configurable. Swap endpoints and API key
 | Component | Provider | Cost |
 |-----------|----------|------|
 | **STT** | DashScope Qwen3-ASR (Singapore) | ~$0.50/mo |
-| **LLM** | Kimi K2.5 via Kilo Code gateway | Free (with API key) |
+| **LLM** | Kimi K2.5 via Kilo Code gateway, with web search | Free (with API key) |
 | **TTS** | DashScope Qwen3-TTS-Flash, Jennifer voice | ~$1-3/mo |
 
 Total: roughly $2-4/month at personal usage levels. No servers to maintain.
+
+### Features
+
+- **Hold-to-talk**: Hold center button for 2+ seconds, speak, release to process
+- **Web search**: Kimi automatically searches the web when your question needs current info
+- **Conversation memory**: Remembers last 5 exchanges (configurable), resets on reboot
+- **Configurable providers**: Swap STT, LLM, TTS by changing URLs and keys in YAML
+- **Dual LLM API formats**: Supports both Anthropic and OpenAI-compatible endpoints
+- **Volume control**: Rotary dial with smooth teal-to-cyan LED gradient
+- **Mute switch**: Hardware mute with red pulse on mute, green pulse on unmute
+- **75 seconds of TTS**: 3.5MB audio buffer in PSRAM
+- **Web dashboard**: ESPHome web server with hardware test buttons and status sensors
+- **OTA updates**: Flash over WiFi after initial USB flash
 
 ## Hardware
 
@@ -62,16 +75,18 @@ Built for the [Home Assistant Voice: Preview Edition](https://www.home-assistant
 ### Voice Pipeline
 
 ```
-[Hold Button] --> Mic (via XMOS DSP) --> Record PCM to PSRAM
+[Hold Button 2+ seconds]
+    --> Mic (via XMOS DSP) --> Record PCM to PSRAM
 [Release Button]
     --> Base64 encode audio
     --> POST to Qwen3-ASR (DashScope multimodal endpoint)
     --> Receive transcript
     --> POST transcript + conversation history to LLM
+        --> If LLM needs current info: automatic web search (up to 3 rounds)
     --> Receive response text
     --> POST text to Qwen3-TTS
     --> Receive audio URL
-    --> Download WAV
+    --> Download WAV to PSRAM (up to 3.5MB / 75 seconds)
     --> Play through speaker (AIC3204 DAC)
 ```
 
@@ -83,11 +98,13 @@ Built for the [Home Assistant Voice: Preview Edition](https://www.home-assistant
 | Recording (button held) | Gentle pulsing blue |
 | Processing (STT + LLM + TTS) | Spinning rainbow |
 | Speaking | Spinning rainbow |
-| Muted | Pulsing red, then off |
-| Volume change | Teal-to-cyan gradient arc |
+| Mute toggled ON | Red pulse (3s) |
+| Mute toggled OFF | Green pulse (3s) |
+| Volume change | Smooth teal-to-cyan gradient arc |
 | Error | Pulsing red |
 | WiFi connecting | Warm white solid |
 | WiFi connected, initializing | Blue twinkle |
+| Short press (< 2s) | Ignored, LEDs clear |
 
 ### Conversation Memory
 
@@ -177,6 +194,7 @@ ai_voice:
   llm_api_format: "openai"
   system_prompt: "You are a concise voice assistant. Keep responses under 3 sentences."
   max_tokens: 256
+  web_search: true  # Kimi searches the web automatically when needed
 
   # STT
   stt_endpoint: "https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
@@ -250,7 +268,7 @@ curl -s http://192.168.1.108/events --max-time 3 | grep "AI Status"
 |-----------|------|---------|
 | Code + rodata | ~2-3 MB | ESP-IDF SPIRAM code mapping |
 | Mic capture buffer | 320 KB | 10 seconds @ 16kHz 16-bit mono |
-| TTS audio buffer | 3.5 MB | ~75 seconds @ 24kHz 16-bit mono |
+| TTS audio buffer | 3.5 MB | ~75 seconds @ 24kHz 16-bit mono (downloaded WAV) |
 | HTTP response buffers | 128 KB | STT + LLM JSON responses |
 | Pipeline task stack | 32 KB | FreeRTOS task on Core 1 |
 | Audio pipeline | ~256 KB | Mixer, resampler, I2S DMA |
