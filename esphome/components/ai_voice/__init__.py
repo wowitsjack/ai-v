@@ -39,6 +39,7 @@ CONF_TTS_MODEL = "tts_model"
 CONF_TTS_VOICE = "tts_voice"
 
 CONF_CONVERSATION_TURNS = "conversation_turns"
+CONF_WEB_SEARCH = "web_search"
 
 ai_voice_ns = cg.esphome_ns.namespace("ai_voice")
 AiVoice = ai_voice_ns.class_("AiVoice", cg.Component)
@@ -79,6 +80,7 @@ CONFIG_SCHEMA = cv.Schema({
     cv.Optional(CONF_TTS_VOICE, default="longxiaochun_v2"): cv.string,
 
     cv.Optional(CONF_CONVERSATION_TURNS, default=5): cv.int_range(min=1, max=20),
+    cv.Optional(CONF_WEB_SEARCH, default=True): cv.boolean,
 }).extend(cv.COMPONENT_SCHEMA)
 
 
@@ -117,6 +119,7 @@ async def to_code(config):
     cg.add(var.set_tts_voice(config[CONF_TTS_VOICE]))
 
     cg.add(var.set_conversation_turns(config[CONF_CONVERSATION_TURNS]))
+    cg.add(var.set_web_search_enabled(config[CONF_WEB_SEARCH]))
 
     cg.add_build_flag("-DUSE_AI_VOICE")
 

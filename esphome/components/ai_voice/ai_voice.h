@@ -66,6 +66,7 @@ class AiVoice : public Component {
   void set_tts_voice(const std::string &v) { this->tts_voice_ = v; }
 
   void set_conversation_turns(int v) { this->max_turns_ = v; }
+  void set_web_search_enabled(bool v) { this->web_search_enabled_ = v; }
 
   // Actions
   void start_recording();
@@ -104,6 +105,7 @@ class AiVoice : public Component {
   std::string tts_voice_;
 
   int max_turns_{5};
+  bool web_search_enabled_{true};
 
   // State
   enum State : uint8_t { STATE_IDLE = 0, STATE_RECORDING, STATE_PROCESSING, STATE_SPEAKING, STATE_ERROR };

@@ -464,22 +464,14 @@ std::string AiVoice::call_llm_anthropic_(const std::string &user_text, const std
   return result;
 }
 
+// Helper: make a single LLM HTTP request, return raw JSON response (caller must free rd.buffer)
 std::string AiVoice::call_llm_openai_(const std::string &user_text, const std::string &model) {
-  ESP_LOGI(TAG, "LLM (openai): %s", model.c_str());
+  ESP_LOGI(TAG, "LLM (openai): %s, web_search=%d", model.c_str(), this->web_search_enabled_);
 
-  cJSON *root = cJSON_CreateObject();
-  cJSON_AddStringToObject(root, "model", model.c_str());
-  cJSON_AddNumberToObject(root, "max_tokens", this->max_tokens_);
+  bool is_kimi = this->llm_endpoint_.find("kimi.com") != std::string::npos;
 
-  // Kimi instant mode: disable thinking for fast voice responses
-  if (this->llm_endpoint_.find("kimi.com") != std::string::npos) {
-    cJSON *thinking = cJSON_CreateObject();
-    cJSON_AddStringToObject(thinking, "type", "disabled");
-    cJSON_AddItemToObject(root, "thinking", thinking);
-  }
-
+  // Build initial messages array
   cJSON *msgs = cJSON_CreateArray();
-  // System message as first message in openai format
   cJSON *sm = cJSON_CreateObject();
   cJSON_AddStringToObject(sm, "role", "system");
   cJSON_AddStringToObject(sm, "content", this->system_prompt_.c_str());
@@ -495,70 +487,140 @@ std::string AiVoice::call_llm_openai_(const std::string &user_text, const std::s
   cJSON_AddStringToObject(um, "role", "user");
   cJSON_AddStringToObject(um, "content", user_text.c_str());
   cJSON_AddItemToArray(msgs, um);
-  cJSON_AddItemToObject(root, "messages", msgs);
 
-  char *json = cJSON_PrintUnformatted(root);
-  cJSON_Delete(root);
-  if (!json) return "";
-
-  ResponseData rd;
-  rd.capacity = HTTP_RESP_BUFFER_SIZE;
-  rd.buffer = (char *) heap_caps_calloc(rd.capacity, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  rd.len = 0;
-
-  esp_http_client_config_t cfg = {};
-  cfg.url = this->llm_endpoint_.c_str();
-  cfg.method = HTTP_METHOD_POST;
-  cfg.timeout_ms = 30000;
-  cfg.crt_bundle_attach = esp_crt_bundle_attach;
-  cfg.buffer_size = 4096;
-  cfg.buffer_size_tx = 4096;
-  cfg.event_handler = text_event_handler;
-  cfg.user_data = &rd;
-
-  auto *client = esp_http_client_init(&cfg);
-  std::string auth = "Bearer " + this->llm_api_key_;
-  esp_http_client_set_header(client, "Content-Type", "application/json");
-  esp_http_client_set_header(client, "Authorization", auth.c_str());
-
-  // Kimi Code gateway requires Kilo Code fingerprint headers
-  if (this->llm_endpoint_.find("kimi.com") != std::string::npos) {
-    esp_http_client_set_header(client, "User-Agent", "Kilo-Code/4.111.0");
-    esp_http_client_set_header(client, "Referer", "https://kilocode.ai");
-    esp_http_client_set_header(client, "Origin", "https://kilocode.ai");
-    esp_http_client_set_header(client, "HTTP-Referer", "https://kilocode.ai");
-    esp_http_client_set_header(client, "X-Title", "Kilo Code");
-    esp_http_client_set_header(client, "X-KiloCode-Version", "4.111.0");
-  }
-
-  esp_http_client_set_post_field(client, json, strlen(json));
-
+  // Tool-calling loop (max 3 rounds for web search)
   std::string result;
-  if (esp_http_client_perform(client) == ESP_OK && esp_http_client_get_status_code(client) == 200) {
+  for (int round = 0; round < 3; round++) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "model", model.c_str());
+    cJSON_AddNumberToObject(root, "max_tokens", this->max_tokens_);
+
+    if (is_kimi) {
+      cJSON *thinking = cJSON_CreateObject();
+      cJSON_AddStringToObject(thinking, "type", "disabled");
+      cJSON_AddItemToObject(root, "thinking", thinking);
+    }
+
+    // Add web search tool for Kimi
+    if (this->web_search_enabled_ && is_kimi) {
+      cJSON *tools = cJSON_CreateArray();
+      cJSON *tool = cJSON_CreateObject();
+      cJSON_AddStringToObject(tool, "type", "builtin_function");
+      cJSON *func = cJSON_CreateObject();
+      cJSON_AddStringToObject(func, "name", "$web_search");
+      cJSON_AddItemToObject(tool, "function", func);
+      cJSON_AddItemToArray(tools, tool);
+      cJSON_AddItemToObject(root, "tools", tools);
+    }
+
+    // Deep copy messages array (cJSON_AddItemToObject transfers ownership)
+    cJSON *msgs_copy = cJSON_Duplicate(msgs, true);
+    cJSON_AddItemToObject(root, "messages", msgs_copy);
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) break;
+
+    ESP_LOGI(TAG, "LLM request round %d (%u bytes)", round, strlen(json));
+
+    ResponseData rd;
+    rd.capacity = HTTP_RESP_BUFFER_SIZE;
+    rd.buffer = (char *) heap_caps_calloc(rd.capacity, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    rd.len = 0;
+    if (!rd.buffer) { free(json); break; }
+
+    esp_http_client_config_t cfg = {};
+    cfg.url = this->llm_endpoint_.c_str();
+    cfg.method = HTTP_METHOD_POST;
+    cfg.timeout_ms = 30000;
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    cfg.buffer_size = 4096;
+    cfg.buffer_size_tx = 4096;
+    cfg.event_handler = text_event_handler;
+    cfg.user_data = &rd;
+
+    auto *client = esp_http_client_init(&cfg);
+    std::string auth = "Bearer " + this->llm_api_key_;
+    esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_header(client, "Authorization", auth.c_str());
+
+    if (is_kimi) {
+      esp_http_client_set_header(client, "User-Agent", "Kilo-Code/4.111.0");
+      esp_http_client_set_header(client, "Referer", "https://kilocode.ai");
+      esp_http_client_set_header(client, "Origin", "https://kilocode.ai");
+      esp_http_client_set_header(client, "HTTP-Referer", "https://kilocode.ai");
+      esp_http_client_set_header(client, "X-Title", "Kilo Code");
+      esp_http_client_set_header(client, "X-KiloCode-Version", "4.111.0");
+    }
+
+    esp_http_client_set_post_field(client, json, strlen(json));
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    free(json);
+
+    if (err != ESP_OK || status != 200) {
+      ESP_LOGE(TAG, "LLM failed (status %d)", status);
+      heap_caps_free(rd.buffer);
+      break;
+    }
+
     rd.buffer[rd.len] = '\0';
     cJSON *r = cJSON_Parse(rd.buffer);
-    if (r) {
-      // OpenAI format: {"choices": [{"message": {"content": "..."}}]}
-      cJSON *choices = cJSON_GetObjectItem(r, "choices");
-      if (choices && cJSON_IsArray(choices)) {
-        cJSON *first = cJSON_GetArrayItem(choices, 0);
-        if (first) {
-          cJSON *msg = cJSON_GetObjectItem(first, "message");
-          if (msg) {
-            cJSON *content = cJSON_GetObjectItem(msg, "content");
-            if (content && cJSON_IsString(content)) result = content->valuestring;
-          }
-        }
+    heap_caps_free(rd.buffer);
+    if (!r) break;
+
+    cJSON *choices = cJSON_GetObjectItem(r, "choices");
+    cJSON *first = choices ? cJSON_GetArrayItem(choices, 0) : nullptr;
+    if (!first) { cJSON_Delete(r); break; }
+
+    cJSON *finish = cJSON_GetObjectItem(first, "finish_reason");
+    std::string finish_reason = (finish && cJSON_IsString(finish)) ? finish->valuestring : "stop";
+
+    cJSON *msg = cJSON_GetObjectItem(first, "message");
+    if (!msg) { cJSON_Delete(r); break; }
+
+    // Check for tool_calls (web search)
+    cJSON *tool_calls = cJSON_GetObjectItem(msg, "tool_calls");
+    if (finish_reason == "tool_calls" && tool_calls && cJSON_IsArray(tool_calls) && cJSON_GetArraySize(tool_calls) > 0) {
+      ESP_LOGI(TAG, "LLM requested web search, round %d", round);
+
+      // Append assistant message with tool_calls to messages
+      cJSON *asst_msg = cJSON_Duplicate(msg, true);
+      cJSON_AddItemToArray(msgs, asst_msg);
+
+      // For each tool call, append tool result
+      int tc_count = cJSON_GetArraySize(tool_calls);
+      for (int tc = 0; tc < tc_count; tc++) {
+        cJSON *tc_item = cJSON_GetArrayItem(tool_calls, tc);
+        cJSON *tc_id = cJSON_GetObjectItem(tc_item, "id");
+        cJSON *tc_func = cJSON_GetObjectItem(tc_item, "function");
+        cJSON *tc_args = tc_func ? cJSON_GetObjectItem(tc_func, "arguments") : nullptr;
+
+        cJSON *tool_msg = cJSON_CreateObject();
+        cJSON_AddStringToObject(tool_msg, "role", "tool");
+        if (tc_id && cJSON_IsString(tc_id))
+          cJSON_AddStringToObject(tool_msg, "tool_call_id", tc_id->valuestring);
+        // Pass the search arguments back as the tool result content
+        if (tc_args && cJSON_IsString(tc_args))
+          cJSON_AddStringToObject(tool_msg, "content", tc_args->valuestring);
+        else
+          cJSON_AddStringToObject(tool_msg, "content", "");
+        cJSON_AddItemToArray(msgs, tool_msg);
       }
+
       cJSON_Delete(r);
+      continue;  // next round
     }
-  } else {
-    ESP_LOGE(TAG, "LLM failed (status %d)", esp_http_client_get_status_code(client));
+
+    // Normal response, extract content
+    cJSON *content = cJSON_GetObjectItem(msg, "content");
+    if (content && cJSON_IsString(content)) result = content->valuestring;
+    cJSON_Delete(r);
+    break;  // done
   }
 
-  esp_http_client_cleanup(client);
-  free(json);
-  heap_caps_free(rd.buffer);
+  cJSON_Delete(msgs);
   return result;
 }
 

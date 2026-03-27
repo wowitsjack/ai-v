@@ -839,6 +839,7 @@ ai_voice:
   tts_voice: "Jennifer"
 
   conversation_turns: 5
+  web_search: true
 
 # ============================================================================
 # Buttons
