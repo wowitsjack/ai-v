@@ -19,7 +19,7 @@ namespace ai_voice {
 static constexpr int PHASE_IDLE = 1;
 static constexpr int PHASE_STT = 2;
 static constexpr int PHASE_RECORDING = 3;
-static constexpr int PHASE_THINKING = 4;   // LLM
+static constexpr int PHASE_THINKING = 4;
 static constexpr int PHASE_SPEAKING = 5;
 static constexpr int PHASE_NOT_READY = 10;
 static constexpr int PHASE_ERROR = 11;
@@ -28,13 +28,21 @@ static constexpr int PHASE_ERROR = 11;
 static constexpr int SAMPLE_RATE = 16000;
 static constexpr int MIC_BYTES_PER_STEREO_PAIR = 8;
 static constexpr int MIC_BYTES_PER_MONO_SAMPLE = 2;
-static constexpr size_t CAPTURE_BUFFER_SIZE = 320000;   // 10s @ 16kHz 16-bit mono
-static constexpr size_t TTS_BUFFER_SIZE = 3670016;       // 3.5MB ~75s of 24kHz 16-bit PCM
+static constexpr size_t CAPTURE_BUFFER_SIZE = 320000;
+static constexpr size_t TTS_BUFFER_SIZE = 3670016;
 static constexpr size_t HTTP_RESP_BUFFER_SIZE = 65536;
 
 struct ConversationTurn {
   std::string role;
   std::string content;
+};
+
+struct LlmProvider {
+  std::string name;
+  std::string endpoint;
+  std::string api_key;
+  std::string model;
+  std::string format;  // "anthropic" or "openai"
 };
 
 class AiVoice : public Component {
@@ -48,11 +56,6 @@ class AiVoice : public Component {
   void set_speaker(speaker::Speaker *spk) { this->speaker_ = spk; }
   void set_media_player(media_player::MediaPlayer *mp) { this->media_player_ = mp; }
 
-  void set_llm_endpoint(const std::string &v) { this->llm_endpoint_ = v; }
-  void set_llm_api_key(const std::string &v) { this->llm_api_key_ = v; }
-  void set_llm_model_default(const std::string &v) { this->llm_model_default_ = v; }
-  void set_llm_model_alt(const std::string &v) { this->llm_model_alt_ = v; }
-  void set_llm_api_format(const std::string &v) { this->llm_api_format_ = v; }
   void set_system_prompt(const std::string &v) { this->system_prompt_ = v; }
   void set_max_tokens(int v) { this->max_tokens_ = v; }
 
@@ -68,16 +71,20 @@ class AiVoice : public Component {
   void set_conversation_turns(int v) { this->max_turns_ = v; }
   void set_web_search_enabled(bool v) { this->web_search_enabled_ = v; }
 
+  // Provider management
+  void add_provider(const LlmProvider &p) { this->providers_.push_back(p); }
+  void cycle_provider();
+
   // Actions
   void start_recording();
   void stop_recording();
-  void toggle_model();
   void abort();
 
   // State queries for YAML
   int get_voice_phase() const { return this->voice_phase_; }
   bool phase_changed() { bool c = this->phase_changed_; this->phase_changed_ = false; return c; }
-  bool is_using_alt_model() const { return this->use_alt_model_; }
+  int get_provider_index() const { return this->current_provider_; }
+  const std::string &get_provider_name() const { return this->providers_[this->current_provider_].name; }
   const std::string &get_last_error() const { return this->last_error_; }
   const std::string &get_last_transcript() const { return this->last_transcript_; }
 
@@ -87,11 +94,6 @@ class AiVoice : public Component {
   speaker::Speaker *speaker_{nullptr};
   media_player::MediaPlayer *media_player_{nullptr};
 
-  std::string llm_endpoint_;
-  std::string llm_api_key_;
-  std::string llm_model_default_;
-  std::string llm_model_alt_;
-  std::string llm_api_format_;  // "anthropic" or "openai"
   std::string system_prompt_;
   int max_tokens_{256};
 
@@ -107,11 +109,14 @@ class AiVoice : public Component {
   int max_turns_{5};
   bool web_search_enabled_{true};
 
+  // Providers
+  std::vector<LlmProvider> providers_;
+  int current_provider_{0};
+
   // State
   enum State : uint8_t { STATE_IDLE = 0, STATE_RECORDING, STATE_PROCESSING, STATE_SPEAKING, STATE_ERROR };
   volatile State state_{STATE_IDLE};
   volatile int voice_phase_{PHASE_NOT_READY};
-  bool use_alt_model_{false};
   bool ready_{false};
   volatile bool phase_changed_{false};
   std::string last_error_;
@@ -122,7 +127,7 @@ class AiVoice : public Component {
   volatile size_t capture_write_pos_{0};
   volatile bool capturing_{false};
 
-  // TTS receive buffer (PSRAM) for download+play
+  // TTS receive buffer (PSRAM)
   uint8_t *tts_buffer_{nullptr};
   size_t tts_data_size_{0};
 
@@ -140,10 +145,10 @@ class AiVoice : public Component {
   // Pipeline steps
   std::string call_stt_(const uint8_t *pcm_data, size_t pcm_len);
   std::string call_llm_(const std::string &user_text);
-  std::string call_llm_anthropic_(const std::string &user_text, const std::string &model);
-  std::string call_llm_openai_(const std::string &user_text, const std::string &model);
-  std::string call_tts_(const std::string &text);  // returns audio URL
-  bool download_and_play_(const std::string &url);  // download WAV and play via speaker
+  std::string call_llm_anthropic_(const std::string &user_text, const LlmProvider &prov);
+  std::string call_llm_openai_(const std::string &user_text, const LlmProvider &prov);
+  std::string call_tts_(const std::string &text);
+  bool download_and_play_(const std::string &url);
 
   // Helpers
   void build_wav_header_(uint8_t *header, size_t pcm_data_size);
@@ -171,10 +176,10 @@ template<typename... Ts> class StopRecordingAction : public Action<Ts...> {
   AiVoice *parent_;
 };
 
-template<typename... Ts> class ToggleModelAction : public Action<Ts...> {
+template<typename... Ts> class CycleProviderAction : public Action<Ts...> {
  public:
-  explicit ToggleModelAction(AiVoice *p) : parent_(p) {}
-  void play(const Ts &...x) override { this->parent_->toggle_model(); }
+  explicit CycleProviderAction(AiVoice *p) : parent_(p) {}
+  void play(const Ts &...x) override { this->parent_->cycle_provider(); }
  protected:
   AiVoice *parent_;
 };

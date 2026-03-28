@@ -76,8 +76,10 @@ void AiVoice::setup() {
       &AiVoice::pipeline_task_func_, "ai_voice", 32768, this, 5,
       this->pipeline_task_stack_, &this->pipeline_task_tcb_, 1);
 
-  ESP_LOGI(TAG, "AI Voice ready (LLM: %s, format: %s)",
-           this->llm_model_default_.c_str(), this->llm_api_format_.c_str());
+  if (!this->providers_.empty()) {
+    ESP_LOGI(TAG, "AI Voice ready (%d providers, default: %s)",
+             this->providers_.size(), this->providers_[0].name.c_str());
+  }
 }
 
 // =============================================================================
@@ -119,11 +121,6 @@ void AiVoice::stop_recording() {
   this->pipeline_requested_ = true;
 }
 
-void AiVoice::toggle_model() {
-  this->use_alt_model_ = !this->use_alt_model_;
-  ESP_LOGI(TAG, "Model: %s", (this->use_alt_model_ ? this->llm_model_alt_ : this->llm_model_default_).c_str());
-}
-
 void AiVoice::abort() {
   this->abort_requested_ = true;
   this->capturing_ = false;
@@ -132,6 +129,15 @@ void AiVoice::abort() {
   }
   this->state_ = STATE_IDLE;
   this->set_phase_(PHASE_IDLE);
+}
+
+void AiVoice::cycle_provider() {
+  if (this->providers_.empty()) return;
+  this->current_provider_ = (this->current_provider_ + 1) % this->providers_.size();
+  this->conversation_.clear();  // clear history on provider switch
+  this->phase_changed_ = true;
+  ESP_LOGI(TAG, "Provider: %s (%s)", this->providers_[this->current_provider_].name.c_str(),
+           this->providers_[this->current_provider_].model.c_str());
 }
 
 void AiVoice::set_phase_(int phase) { this->voice_phase_ = phase; this->phase_changed_ = true; }
@@ -386,20 +392,26 @@ std::string AiVoice::call_stt_(const uint8_t *pcm_data, size_t pcm_len) {
 // =============================================================================
 
 std::string AiVoice::call_llm_(const std::string &user_text) {
-  const std::string &model = this->use_alt_model_ ? this->llm_model_alt_ : this->llm_model_default_;
-  if (this->llm_api_format_ == "anthropic")
-    return call_llm_anthropic_(user_text, model);
+  if (this->providers_.empty()) return "";
+  const auto &prov = this->providers_[this->current_provider_];
+  if (prov.format == "anthropic")
+    return call_llm_anthropic_(user_text, prov);
   else
-    return call_llm_openai_(user_text, model);
+    return call_llm_openai_(user_text, prov);
 }
 
-std::string AiVoice::call_llm_anthropic_(const std::string &user_text, const std::string &model) {
-  ESP_LOGI(TAG, "LLM (anthropic): %s", model.c_str());
+std::string AiVoice::call_llm_anthropic_(const std::string &user_text, const LlmProvider &prov) {
+  ESP_LOGI(TAG, "LLM (%s, anthropic): %s", prov.name.c_str(), prov.model.c_str());
 
   cJSON *root = cJSON_CreateObject();
-  cJSON_AddStringToObject(root, "model", model.c_str());
+  cJSON_AddStringToObject(root, "model", prov.model.c_str());
   cJSON_AddNumberToObject(root, "max_tokens", this->max_tokens_);
   cJSON_AddStringToObject(root, "system", this->system_prompt_.c_str());
+
+  // MiniMax requires temperature > 0
+  if (prov.endpoint.find("minimax") != std::string::npos) {
+    cJSON_AddNumberToObject(root, "temperature", 0.2);
+  }
 
   cJSON *msgs = cJSON_CreateArray();
   for (const auto &t : this->conversation_) {
@@ -424,7 +436,7 @@ std::string AiVoice::call_llm_anthropic_(const std::string &user_text, const std
   rd.len = 0;
 
   esp_http_client_config_t cfg = {};
-  cfg.url = this->llm_endpoint_.c_str();
+  cfg.url = prov.endpoint.c_str();
   cfg.method = HTTP_METHOD_POST;
   cfg.timeout_ms = 30000;
   cfg.crt_bundle_attach = esp_crt_bundle_attach;
@@ -435,7 +447,7 @@ std::string AiVoice::call_llm_anthropic_(const std::string &user_text, const std
 
   auto *client = esp_http_client_init(&cfg);
   esp_http_client_set_header(client, "Content-Type", "application/json");
-  esp_http_client_set_header(client, "x-api-key", this->llm_api_key_.c_str());
+  esp_http_client_set_header(client, "x-api-key", prov.api_key.c_str());
   esp_http_client_set_header(client, "anthropic-version", "2023-06-01");
   esp_http_client_set_post_field(client, json, strlen(json));
 
@@ -446,10 +458,15 @@ std::string AiVoice::call_llm_anthropic_(const std::string &user_text, const std
     if (r) {
       cJSON *content = cJSON_GetObjectItem(r, "content");
       if (content && cJSON_IsArray(content)) {
-        cJSON *first = cJSON_GetArrayItem(content, 0);
-        if (first) {
-          cJSON *text = cJSON_GetObjectItem(first, "text");
-          if (text && cJSON_IsString(text)) result = text->valuestring;
+        // Iterate blocks, find the "text" type (skip "thinking")
+        int n = cJSON_GetArraySize(content);
+        for (int i = 0; i < n; i++) {
+          cJSON *block = cJSON_GetArrayItem(content, i);
+          cJSON *btype = cJSON_GetObjectItem(block, "type");
+          if (btype && cJSON_IsString(btype) && strcmp(btype->valuestring, "text") == 0) {
+            cJSON *text = cJSON_GetObjectItem(block, "text");
+            if (text && cJSON_IsString(text)) { result = text->valuestring; break; }
+          }
         }
       }
       cJSON_Delete(r);
@@ -464,11 +481,10 @@ std::string AiVoice::call_llm_anthropic_(const std::string &user_text, const std
   return result;
 }
 
-// Helper: make a single LLM HTTP request, return raw JSON response (caller must free rd.buffer)
-std::string AiVoice::call_llm_openai_(const std::string &user_text, const std::string &model) {
-  ESP_LOGI(TAG, "LLM (openai): %s, web_search=%d", model.c_str(), this->web_search_enabled_);
+std::string AiVoice::call_llm_openai_(const std::string &user_text, const LlmProvider &prov) {
+  ESP_LOGI(TAG, "LLM (%s, openai): %s", prov.name.c_str(), prov.model.c_str());
 
-  bool is_kimi = this->llm_endpoint_.find("kimi.com") != std::string::npos;
+  bool is_kimi = prov.endpoint.find("kimi.com") != std::string::npos;
 
   // Build initial messages array
   cJSON *msgs = cJSON_CreateArray();
@@ -492,7 +508,7 @@ std::string AiVoice::call_llm_openai_(const std::string &user_text, const std::s
   std::string result;
   for (int round = 0; round < 3; round++) {
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "model", model.c_str());
+    cJSON_AddStringToObject(root, "model", prov.model.c_str());
     cJSON_AddNumberToObject(root, "max_tokens", this->max_tokens_);
 
     if (is_kimi) {
@@ -530,7 +546,7 @@ std::string AiVoice::call_llm_openai_(const std::string &user_text, const std::s
     if (!rd.buffer) { free(json); break; }
 
     esp_http_client_config_t cfg = {};
-    cfg.url = this->llm_endpoint_.c_str();
+    cfg.url = prov.endpoint.c_str();
     cfg.method = HTTP_METHOD_POST;
     cfg.timeout_ms = 30000;
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
@@ -540,7 +556,7 @@ std::string AiVoice::call_llm_openai_(const std::string &user_text, const std::s
     cfg.user_data = &rd;
 
     auto *client = esp_http_client_init(&cfg);
-    std::string auth = "Bearer " + this->llm_api_key_;
+    std::string auth = "Bearer " + prov.api_key;
     esp_http_client_set_header(client, "Content-Type", "application/json");
     esp_http_client_set_header(client, "Authorization", auth.c_str());
 

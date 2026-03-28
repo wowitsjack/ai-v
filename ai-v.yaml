@@ -160,18 +160,18 @@ switch:
 # Binary Sensors
 # ============================================================================
 binary_sensor:
-  # Center Button: Hold to record (min 2s), release to process
+  # Center Button: Hold 2s+ to record, double-tap to cycle provider
   - platform: gpio
     id: center_button
     pin:
       number: GPIO0
       inverted: true
     on_press:
+      - lambda: id(button_press_time) = millis();
       - if:
           condition:
             switch.is_off: master_mute_switch
           then:
-            - lambda: id(button_press_time) = millis();
             - ai_voice.start_recording: ai_assistant
             - script.execute: control_leds
     on_release:
@@ -184,6 +184,17 @@ binary_sensor:
           else:
             - ai_voice.abort: ai_assistant
             - script.execute: control_leds
+    on_multi_click:
+      # Double tap: cycle provider
+      - timing:
+          - ON for at most 0.5s
+          - OFF for at most 0.5s
+          - ON for at most 0.5s
+          - OFF for at least 0.2s
+        then:
+          - ai_voice.abort: ai_assistant
+          - ai_voice.cycle_provider: ai_assistant
+          - script.execute: show_provider_color
 
   # Hardware mute switch
   - platform: gpio
@@ -405,16 +416,6 @@ light:
             }
             if (brightness_step == 0 || brightness_step == brightness_step_number) {
               brightness_decreasing = !brightness_decreasing;
-            }
-      - addressable_lambda:
-          name: "Model Toggle"
-          update_interval: 50ms
-          lambda: |-
-            // Purple flash for Sonnet, blue for Haiku
-            bool alt = id(ai_assistant).is_using_alt_model();
-            Color color = alt ? Color(160, 32, 240) : Color(24, 187, 242);
-            for (uint8_t i = 0; i < 12; i++) {
-              it[i] = color;
             }
       - addressable_twinkle:
           name: "Twinkle"
@@ -704,6 +705,29 @@ script:
           id: voice_assistant_leds
           effect: "Error"
 
+  - id: show_provider_color
+    mode: restart
+    then:
+      - lambda: id(mute_animation_active) = true;
+      - lambda: |-
+          // Provider colors: Kimi=cyan, Claude=orange, DeepSeek=blue, MiniMax=green
+          int idx = id(ai_assistant).get_provider_index();
+          auto call = id(voice_assistant_leds).make_call();
+          call.set_state(true);
+          call.set_brightness(1.0f);
+          switch(idx) {
+            case 0: call.set_rgb(0.0f, 0.9f, 1.0f); break;  // Kimi: cyan
+            case 1: call.set_rgb(1.0f, 0.5f, 0.0f); break;  // Claude: orange
+            case 2: call.set_rgb(0.0f, 0.4f, 1.0f); break;  // DeepSeek: blue
+            case 3: call.set_rgb(0.0f, 1.0f, 0.3f); break;  // MiniMax: green
+            default: call.set_rgb(1.0f, 1.0f, 1.0f); break;
+          }
+          call.set_effect("none");
+          call.perform();
+      - delay: 1500ms
+      - light.turn_off: voice_assistant_leds
+      - lambda: id(mute_animation_active) = false;
+
   - id: dial_timeout
     mode: restart
     then:
@@ -873,21 +897,38 @@ ai_voice:
   speaker: tts_resampling_speaker
   media_player: media_player_out
 
-  # LLM (Kimi via Kilo Code gateway, OpenAI-compatible)
-  llm_endpoint: "https://api.kimi.com/coding/v1/chat/completions"
-  llm_api_key: !secret kimi_api_key
-  llm_model_default: "kimi-for-coding"
-  llm_model_alt: "kimi-for-coding"
-  llm_api_format: "openai"
+  # LLM Providers (cycle with short press)
+  providers:
+    - name: "Claude"
+      endpoint: "https://api.anthropic.com/v1/messages"
+      api_key: !secret claude_api_key
+      model: "claude-sonnet-4-6"
+      format: "anthropic"
+    - name: "Kimi"
+      endpoint: "https://api.kimi.com/coding/v1/chat/completions"
+      api_key: !secret kimi_api_key
+      model: "kimi-for-coding"
+      format: "openai"
+    - name: "DeepSeek"
+      endpoint: "https://api.deepseek.com/chat/completions"
+      api_key: !secret deepseek_api_key
+      model: "deepseek-reasoner"
+      format: "openai"
+    - name: "MiniMax"
+      endpoint: "https://api.minimax.io/anthropic/v1/messages"
+      api_key: !secret minimax_api_key
+      model: "MiniMax-M2.7-highspeed"
+      format: "anthropic"
+
   system_prompt: "You are a concise voice assistant. Keep responses under 3 sentences."
   max_tokens: 256
 
-  # STT (DashScope Qwen3-ASR via multimodal endpoint, base64 audio)
+  # STT
   stt_endpoint: "https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
   stt_api_key: !secret dashscope_api_key
   stt_model: "qwen3-asr-flash-2026-02-10"
 
-  # TTS (DashScope Qwen3-TTS, returns audio URL)
+  # TTS
   tts_endpoint: "https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
   tts_api_key: !secret dashscope_api_key
   tts_model: "qwen3-tts-flash"
@@ -1051,6 +1092,11 @@ text_sensor:
       name: "Connected SSID"
     mac_address:
       name: "MAC Address"
+  - platform: template
+    name: "Provider"
+    id: provider_name
+    update_interval: never
+    lambda: return id(ai_assistant).get_provider_name();
   - platform: template
     name: "Last Transcript"
     id: last_transcript
